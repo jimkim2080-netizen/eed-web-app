@@ -65,278 +65,126 @@ def sanitize_filename(text: str) -> str:
 
 def make_mp3_file(text: str, rid: int, lang: str = "en") -> str:
     if not gTTS:
-        raise RuntimeError("gTTS가 설치되지 않았습니다. requirements.txt를 확인하세요.")
-    if not text.strip():
-        raise ValueError("텍스트가 비어 있습니다.")
-
-    fname = f"{sanitize_filename(text)}_{lang}_{rid}.mp3"
-    path = os.path.join(AUDIO_DIR, fname)
-    gTTS(text=text, lang=lang).save(path)
-
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE sentences SET mp3_path=? WHERE id=?", (path, rid))
-    conn.commit()
-    conn.close()
+        raise RuntimeError("gTTS가 설치되지 않았습니다.")
+    filename = f"{rid}_{sanitize_filename(text)}.mp3"
+    path = os.path.join(AUDIO_DIR, filename)
+    if not os.path.exists(path):
+        tts = gTTS(text=text, lang=lang)
+        tts.save(path)
     return path
 
 
-def import_from_excel_file(uploaded_file) -> int:
+def ensure_sentence_mp3(row: sqlite3.Row | dict, lang: str = "en") -> str | None:
+    text = (row["source_text"] if isinstance(row, dict) else row["source_text"]) or ""
+    rid = int((row["id"] if isinstance(row, dict) else row["id"]) or 0)
+    existing = (row["mp3_path"] if isinstance(row, dict) else row["mp3_path"]) or ""
+
+    if existing:
+        if os.path.isabs(existing) and os.path.exists(existing):
+            return existing
+        local_rel = os.path.join(BASE_DIR, existing)
+        if os.path.exists(local_rel):
+            return local_rel
+        local_audio = os.path.join(AUDIO_DIR, os.path.basename(existing))
+        if os.path.exists(local_audio):
+            return local_audio
+
+    try:
+        new_path = make_mp3_file(text, rid, lang=lang)
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("UPDATE sentences SET mp3_path=? WHERE id=?", (new_path, rid))
+        conn.commit()
+        conn.close()
+        return new_path
+    except Exception:
+        return None
+
+
+def translate_en_to_ko(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if GoogleTranslator is None:
+        return "번역기 모듈이 설치되지 않았습니다. requirements.txt를 확인하세요."
+    try:
+        return GoogleTranslator(source="en", target="ko").translate(text)
+    except Exception as e:
+        return f"번역 오류: {e}"
+
+
+def import_from_excel(uploaded_file):
     df = pd.read_excel(uploaded_file)
-    inserted = 0
+    expected = ["English", "Korean", "mp3", "DateAdded", "Category"]
+    for col in expected:
+        if col not in df.columns:
+            raise ValueError(f"엑셀 컬럼 누락: {col}")
+
     conn = get_conn()
     cur = conn.cursor()
-
+    inserted = 0
     for _, row in df.iterrows():
-        eng = str(row.get("English") or "").strip()
-        kor = str(row.get("Korean") or "").strip()
-        cat = str(row.get("Category") or "").strip()
-
-        if eng.lower() == "nan":
-            eng = ""
-        if kor.lower() == "nan":
-            kor = ""
-        if cat.lower() == "nan":
-            cat = ""
-
-        if eng:
-            cur.execute(
-                "INSERT INTO sentences(source_text,target_text,mp3_path,created_at,category) VALUES(?,?,?,?,?)",
-                (eng, kor, "", dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), cat),
-            )
-            inserted += 1
-
+        cur.execute(
+            """
+            INSERT INTO sentences(source_text, target_text, mp3_path, created_at, category)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(row.get("English", "") or "").strip(),
+                str(row.get("Korean", "") or "").strip(),
+                str(row.get("mp3", "") or "").strip(),
+                str(row.get("DateAdded", "") or "").strip(),
+                str(row.get("Category", "") or "").strip(),
+            ),
+        )
+        inserted += 1
     conn.commit()
     conn.close()
     return inserted
 
 
-def export_sentences_to_excel_bytes() -> bytes:
+def export_to_excel_bytes() -> bytes:
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT id, source_text, target_text, mp3_path, created_at, category FROM sentences ORDER BY id DESC")
-    rows = cur.fetchall()
-    conn.close()
-
-    df = pd.DataFrame(rows, columns=["ID", "English", "Korean", "MP3", "Date", "Category"])
-    bio = BytesIO()
-    df.to_excel(bio, index=False)
-    bio.seek(0)
-    return bio.getvalue()
-
-
-def list_sentences(category: str = "전체", limit: int | None = 100) -> pd.DataFrame:
-    conn = get_conn()
-    cur = conn.cursor()
-    sql = "SELECT id, source_text, target_text, mp3_path, created_at, category FROM sentences"
-    params = []
-    if category and category != "전체":
-        sql += " WHERE category=?"
-        params.append(category)
-    sql += " ORDER BY id DESC"
-    if limit:
-        sql += " LIMIT ?"
-        params.append(limit)
-    cur.execute(sql, tuple(params))
-    rows = cur.fetchall()
-    conn.close()
-
-    data = []
-    for row in rows:
-        data.append(
-            {
-                "ID": row["id"],
-                "English": row["source_text"],
-                "Korean": row["target_text"],
-                "MP3": os.path.basename(row["mp3_path"]) if row["mp3_path"] else "",
-                "Date": row["created_at"],
-                "Category": row["category"] or "",
-            }
-        )
-    return pd.DataFrame(data)
-
-
-def get_sentence_by_id(rid: int):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM sentences WHERE id=?", (rid,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def save_sentence(english: str, korean: str, category: str) -> int:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO sentences(source_text,target_text,mp3_path,created_at,category) VALUES(?,?,?,?,?)",
-        (english, korean, "", dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), category),
+    df = pd.read_sql_query(
+        "SELECT id, source_text AS English, target_text AS Korean, mp3_path AS mp3, created_at AS DateAdded, category AS Category FROM sentences ORDER BY id DESC",
+        conn,
     )
-    rid = cur.lastrowid
-    conn.commit()
     conn.close()
-    return rid
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="EED")
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
-def update_sentence(rid: int, english: str, korean: str, category: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE sentences SET source_text=?, target_text=?, category=? WHERE id=?",
-        (english, korean, category, rid),
-    )
-    conn.commit()
-    conn.close()
-
-
-def delete_sentence(rid: int):
-    row = get_sentence_by_id(rid)
-    if row and row["mp3_path"] and os.path.exists(row["mp3_path"]):
-        try:
-            os.remove(row["mp3_path"])
-        except Exception:
-            pass
-
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM sentences WHERE id=?", (rid,))
-    conn.commit()
-    conn.close()
-
-
-def list_categories() -> list[str]:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT DISTINCT category FROM sentences WHERE category IS NOT NULL AND TRIM(category) <> '' ORDER BY category")
-    rows = cur.fetchall()
-    conn.close()
-    return ["전체"] + [r[0] for r in rows]
-
-
-def count_sentences(category: str = "전체") -> int:
-    conn = get_conn()
-    cur = conn.cursor()
-    if category and category != "전체":
-        cur.execute("SELECT COUNT(*) FROM sentences WHERE category=?", (category,))
-    else:
-        cur.execute("SELECT COUNT(*) FROM sentences")
-    total = cur.fetchone()[0]
-    conn.close()
-    return total
-
-
-def translate_to_korean(text: str) -> str:
-    if not GoogleTranslator:
-        raise RuntimeError("deep-translator가 설치되지 않았습니다.")
-    return GoogleTranslator(source="en", target="ko").translate(text)
-
-
-def render_repeat_audio_player(audio_path: str, repeat_count: int = 10):
+def play_audio_n_times(audio_path: str, repeat_count: int = 1):
     if not audio_path or not os.path.exists(audio_path):
-        st.warning("재생할 MP3 파일이 없습니다.")
+        st.warning("오디오 파일이 없습니다.")
         return
 
-    audio_bytes = open(audio_path, "rb").read()
-    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-    html = f"""
-    <div style="padding:0.1rem 0;">
-      <audio id="eed_player" controls autoplay style="width:100%;">
-        <source src="data:audio/mp3;base64,{audio_b64}" type="audio/mp3">
-      </audio>
-      <div style="font-size:0.85rem;color:#666;margin-top:0.25rem;">반복 재생: {repeat_count}회</div>
-    </div>
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+    audio_base64 = base64.b64encode(audio_bytes).decode()
+
+    html_code = f"""
+    <audio id="player" controls autoplay style="width:100%;">
+        <source src="data:audio/mp3;base64,{audio_base64}" type="audio/mp3">
+        Your browser does not support the audio element.
+    </audio>
     <script>
-    const player = document.getElementById("eed_player");
-    let playCount = 1;
+    const player = document.getElementById("player");
+    let count = 1;
     const repeatCount = {repeat_count};
     player.onended = function() {{
-        if (playCount < repeatCount) {{
-            playCount += 1;
+        if (count < repeatCount) {{
+            count++;
             player.currentTime = 0;
             player.play();
         }}
     }};
     </script>
     """
-    components.html(html, height=95)
-
-
-def search_word_meaning(word: str) -> str:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT meaning FROM dictionary WHERE word=? ORDER BY id DESC LIMIT 1", (word,))
-    row = cur.fetchone()
-
-    if row:
-        meaning = row[0]
-    else:
-        if not GoogleTranslator:
-            meaning = "번역 불가 (deep-translator 미설치)"
-        else:
-            meaning = GoogleTranslator(source="en", target="ko").translate(word)
-            cur.execute("INSERT INTO dictionary(word, meaning) VALUES(?, ?)", (word, meaning))
-            conn.commit()
-
-    conn.close()
-    return meaning
-
-
-def add_wordbook(word: str, meaning: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO dictionary(word, meaning) VALUES(?, ?)", (word, meaning))
-    conn.commit()
-    conn.close()
-
-
-def list_wordbook() -> pd.DataFrame:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT id, word, meaning FROM dictionary ORDER BY id DESC")
-    rows = cur.fetchall()
-    conn.close()
-    return pd.DataFrame(rows, columns=["ID", "Word", "Meaning"])
-
-
-def update_wordbook(rid: int, word: str, meaning: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE dictionary SET word=?, meaning=? WHERE id=?", (word, meaning, rid))
-    conn.commit()
-    conn.close()
-
-
-def delete_wordbook(rid: int):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM dictionary WHERE id=?", (rid,))
-    conn.commit()
-    conn.close()
-
-
-def queue_sentence_form(sentence_id=None, english="", korean="", category=""):
-    st.session_state.pending_sentence_form = {
-        "sentence_id": sentence_id,
-        "sentence_english": english,
-        "sentence_korean": korean,
-        "sentence_category": category,
-    }
-
-
-def reset_sentence_form():
-    queue_sentence_form(None, "", "", "")
-
-
-def queue_wordbook_form(wordbook_id=None, word="", meaning=""):
-    st.session_state.pending_wordbook_form = {
-        "wordbook_id": wordbook_id,
-        "wordbook_word": word,
-        "wordbook_meaning": meaning,
-    }
-
-
-def reset_wordbook_form():
-    queue_wordbook_form(None, "", "")
+    components.html(html_code, height=90)
 
 
 def prepare_session_state():
@@ -344,63 +192,147 @@ def prepare_session_state():
         "sentence_id": None,
         "sentence_english": "",
         "sentence_korean": "",
+        "sentence_mp3": "",
         "sentence_category": "",
-        "wordbook_id": None,
+        "selected_sentence_id": None,
+        "selected_wordbook_id": None,
         "wordbook_word": "",
         "wordbook_meaning": "",
-        "dict_search_word": "",
-        "dict_search_result": "",
         "pending_sentence_form": None,
-        "pending_wordbook_form": None,
-        "repeat_count": 10,
+        "pending_word_form": None,
+        "pending_translation": None,
     }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 
 def apply_pending_updates():
     pending_sentence = st.session_state.get("pending_sentence_form")
     if pending_sentence:
-        for key, value in pending_sentence.items():
-            st.session_state[key] = value
-        st.session_state.pending_sentence_form = None
+        st.session_state["sentence_id"] = pending_sentence.get("sentence_id")
+        st.session_state["sentence_english"] = pending_sentence.get("sentence_english", "")
+        st.session_state["sentence_korean"] = pending_sentence.get("sentence_korean", "")
+        st.session_state["sentence_mp3"] = pending_sentence.get("sentence_mp3", "")
+        st.session_state["sentence_category"] = pending_sentence.get("sentence_category", "")
+        st.session_state["pending_sentence_form"] = None
 
-    pending_wordbook = st.session_state.get("pending_wordbook_form")
-    if pending_wordbook:
-        for key, value in pending_wordbook.items():
-            st.session_state[key] = value
-        st.session_state.pending_wordbook_form = None
+    pending_word = st.session_state.get("pending_word_form")
+    if pending_word:
+        st.session_state["selected_wordbook_id"] = pending_word.get("wordbook_id")
+        st.session_state["wordbook_word"] = pending_word.get("word", "")
+        st.session_state["wordbook_meaning"] = pending_word.get("meaning", "")
+        st.session_state["pending_word_form"] = None
+
+    pending_translation = st.session_state.get("pending_translation")
+    if pending_translation is not None:
+        st.session_state["sentence_korean"] = pending_translation
+        st.session_state["pending_translation"] = None
+
+
+def reset_sentence_form():
+    st.session_state["sentence_id"] = None
+    st.session_state["sentence_english"] = ""
+    st.session_state["sentence_korean"] = ""
+    st.session_state["sentence_mp3"] = ""
+    st.session_state["sentence_category"] = ""
+
+
+def reset_word_form():
+    st.session_state["selected_wordbook_id"] = None
+    st.session_state["wordbook_word"] = ""
+    st.session_state["wordbook_meaning"] = ""
+
+
+def get_sentence_df(category: str = "All", search: str = "", limit: int = 100):
+    conn = get_conn()
+    query = "SELECT id, source_text, target_text, mp3_path, created_at, category FROM sentences"
+    params = []
+    clauses = []
+    if category and category != "All":
+        clauses.append("category = ?")
+        params.append(category)
+    if search:
+        clauses.append("(source_text LIKE ? OR target_text LIKE ?)")
+        params.extend([f"%{search}%", f"%{search}%"])
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(int(limit))
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return df
+
+
+def get_categories():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT category FROM sentences WHERE category IS NOT NULL AND category <> '' ORDER BY category")
+    rows = [r[0] for r in cur.fetchall()]
+    conn.close()
+    return ["All"] + rows
+
+
+def save_sentence(sentence_id, eng, kor, mp3, category):
+    conn = get_conn()
+    cur = conn.cursor()
+    now = dt.datetime.now().strftime("%Y-%m-%d")
+    if sentence_id:
+        cur.execute(
+            "UPDATE sentences SET source_text=?, target_text=?, mp3_path=?, category=? WHERE id=?",
+            (eng, kor, mp3, category, sentence_id),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO sentences(source_text, target_text, mp3_path, created_at, category) VALUES (?, ?, ?, ?, ?)",
+            (eng, kor, mp3, now, category),
+        )
+    conn.commit()
+    conn.close()
+
+
+def delete_sentence(sentence_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sentences WHERE id=?", (sentence_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_wordbook_df():
+    conn = get_conn()
+    df = pd.read_sql_query("SELECT id, word, meaning FROM dictionary ORDER BY id DESC", conn)
+    conn.close()
+    return df
+
+
+def save_word(wordbook_id, word, meaning):
+    conn = get_conn()
+    cur = conn.cursor()
+    if wordbook_id:
+        cur.execute("UPDATE dictionary SET word=?, meaning=? WHERE id=?", (word, meaning, wordbook_id))
+    else:
+        cur.execute("INSERT INTO dictionary(word, meaning) VALUES (?, ?)", (word, meaning))
+    conn.commit()
+    conn.close()
+
+
+def delete_word(wordbook_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM dictionary WHERE id=?", (wordbook_id,))
+    conn.commit()
+    conn.close()
 
 
 def apply_compact_css():
     st.markdown(
         """
         <style>
-        .block-container {
-            padding-top: 0.7rem !important;
-            padding-bottom: 0.6rem !important;
-            max-width: 1200px;
-        }
-        h1, h2, h3 { margin-top: 0.1rem !important; margin-bottom: 0.45rem !important; }
-        div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stButton"]) {
-            gap: 0.35rem;
-        }
-        div[data-testid="stDataFrame"] {
-            border-radius: 10px;
-            overflow: hidden;
-        }
-        @media (max-width: 768px) {
-            .block-container {
-                padding-left: 0.55rem !important;
-                padding-right: 0.55rem !important;
-                padding-top: 0.45rem !important;
-            }
-            button[kind="primary"], button[kind="secondary"] {
-                min-height: 2.75rem !important;
-                font-size: 1rem !important;
-            }
-        }
+        .block-container {padding-top: 1rem; padding-bottom: 1rem;}
+        div[data-testid="stHorizontalBlock"] button {height: 2.8rem; font-size: 1rem;}
+        .stTabs [data-baseweb="tab-list"] {gap: 0.2rem;}
+        .stTabs [data-baseweb="tab"] {padding: 0.4rem 0.8rem;}
         </style>
         """,
         unsafe_allow_html=True,
@@ -408,252 +340,343 @@ def apply_compact_css():
 
 
 def render_sentence_editor():
-    st.markdown("#### 입력 / 수정")
-    english = st.text_area("영어", key="sentence_english", height=100)
-    korean = st.text_area("한글", key="sentence_korean", height=100)
-    st.text_input("카테고리", key="sentence_category")
+    st.subheader("입력 / 수정")
+    english = st.text_area("English", key="sentence_english", height=100)
+    korean = st.text_area("Korean", key="sentence_korean", height=100)
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        category = st.text_input("Category", key="sentence_category")
+    with c2:
+        st.text_input("MP3 Path", key="sentence_mp3", disabled=True)
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        if st.button("저장", use_container_width=True, key="btn_sentence_save"):
-            if not english.strip():
-                st.warning("영문 입력이 필요합니다.")
-            else:
-                rid = save_sentence(english.strip(), korean.strip(), st.session_state.sentence_category.strip())
-                st.session_state.sentence_id = rid
-                st.success(f"저장 완료: ID {rid}")
-                st.rerun()
+        if st.button("EN→KO 번역", use_container_width=True, key="btn_translate"):
+            st.session_state["pending_translation"] = translate_en_to_ko(english)
+            st.rerun()
     with c2:
-        if st.button("수정", use_container_width=True, key="btn_sentence_update"):
-            if not st.session_state.sentence_id:
-                st.warning("먼저 목록에서 문장을 선택하세요.")
+        if st.button("저장", use_container_width=True, key="btn_save_sentence"):
+            if not english.strip():
+                st.warning("영문 문장을 입력하세요.")
             else:
-                update_sentence(
-                    st.session_state.sentence_id,
+                save_sentence(
+                    st.session_state.get("sentence_id"),
                     english.strip(),
                     korean.strip(),
-                    st.session_state.sentence_category.strip(),
+                    st.session_state.get("sentence_mp3", ""),
+                    category.strip(),
                 )
-                st.success("수정되었습니다.")
+                st.success("저장되었습니다.")
+                reset_sentence_form()
                 st.rerun()
     with c3:
-        if st.button("삭제", use_container_width=True, key="btn_sentence_delete"):
-            if not st.session_state.sentence_id:
-                st.warning("먼저 목록에서 문장을 선택하세요.")
-            else:
-                delete_sentence(st.session_state.sentence_id)
-                reset_sentence_form()
+        if st.button("삭제", use_container_width=True, key="btn_delete_sentence"):
+            sid = st.session_state.get("sentence_id")
+            if sid:
+                delete_sentence(sid)
                 st.success("삭제되었습니다.")
+                reset_sentence_form()
                 st.rerun()
+            else:
+                st.warning("삭제할 문장을 먼저 불러오세요.")
     with c4:
-        if st.button("초기화", use_container_width=True, key="btn_sentence_reset"):
+        if st.button("초기화", use_container_width=True, key="btn_reset_sentence"):
             reset_sentence_form()
             st.rerun()
 
-    c5, c6 = st.columns(2)
-    with c5:
-        if st.button("번역 EN→KO", use_container_width=True, key="btn_translate_sentence"):
-            if not english.strip():
-                st.warning("영어 문장을 먼저 입력하세요.")
-            else:
-                try:
-                    translated = translate_to_korean(english.strip())
-                    queue_sentence_form(
-                        sentence_id=st.session_state.sentence_id,
-                        english=english.strip(),
-                        korean=translated,
-                        category=st.session_state.sentence_category.strip(),
-                    )
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"번역 오류: {e}")
-    with c6:
+    st.divider()
+    st.subheader("선택 문장 MP3")
+    current_text = st.session_state.get("sentence_english", "").strip()
+    current_id = st.session_state.get("sentence_id") or 0
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
         if st.button("MP3 생성", use_container_width=True, key="btn_make_mp3"):
-            if not st.session_state.sentence_id:
-                st.warning("먼저 저장하거나 목록에서 항목을 선택하세요.")
-            elif not english.strip():
-                st.warning("영문 문장이 비어 있습니다.")
+            if not current_text:
+                st.warning("먼저 문장을 불러오거나 입력하세요.")
             else:
                 try:
-                    path = make_mp3_file(english.strip(), st.session_state.sentence_id, "en")
-                    st.success(f"MP3 생성 완료: {os.path.basename(path)}")
+                    path = make_mp3_file(current_text, current_id or 999999, lang="en")
+                    st.session_state["sentence_mp3"] = path
+                    if current_id:
+                        conn = get_conn()
+                        cur = conn.cursor()
+                        cur.execute("UPDATE sentences SET mp3_path=? WHERE id=?", (path, current_id))
+                        conn.commit()
+                        conn.close()
+                    st.success("MP3 생성 완료")
                     st.audio(path)
                 except Exception as e:
-                    st.error(f"MP3 오류: {e}")
+                    st.error(f"MP3 생성 실패: {e}")
+    with c2:
+        if st.button("1회 재생", use_container_width=True, key="btn_editor_play_once"):
+            path = st.session_state.get("sentence_mp3", "")
+            if path and os.path.exists(path):
+                play_audio_n_times(path, 1)
+            elif current_text:
+                path = ensure_sentence_mp3({"id": current_id or 999999, "source_text": current_text, "mp3_path": path}, lang="en")
+                if path:
+                    st.session_state["sentence_mp3"] = path
+                    play_audio_n_times(path, 1)
+                else:
+                    st.warning("재생할 MP3를 만들 수 없습니다.")
+            else:
+                st.warning("먼저 문장을 불러오거나 입력하세요.")
+    with c3:
+        if st.button("10회 재생", use_container_width=True, key="btn_editor_play_repeat"):
+            path = st.session_state.get("sentence_mp3", "")
+            if path and os.path.exists(path):
+                play_audio_n_times(path, 10)
+            elif current_text:
+                path = ensure_sentence_mp3({"id": current_id or 999999, "source_text": current_text, "mp3_path": path}, lang="en")
+                if path:
+                    st.session_state["sentence_mp3"] = path
+                    play_audio_n_times(path, 10)
+                else:
+                    st.warning("재생할 MP3를 만들 수 없습니다.")
+            else:
+                st.warning("먼저 문장을 불러오거나 입력하세요.")
 
 
 def render_sentence_list_and_player():
-    top1, top2, top3 = st.columns([1.2, 0.9, 0.9])
-    with top1:
-        selected_category = st.selectbox("카테고리", list_categories(), index=0, key="select_sentence_category")
-    with top2:
-        row_limit = st.selectbox("표시 개수", [50, 100, 200, 500], index=1, key="select_sentence_limit")
-    with top3:
-        repeat_count = st.selectbox("재생 횟수", [1, 3, 5, 10], index=3, key="repeat_count")
+    st.subheader("목록 / 재생")
 
-    total_count = count_sentences(selected_category)
-    df = list_sentences(selected_category, limit=row_limit)
-    st.caption(f"{selected_category} · 총 {total_count:,}개 · 화면 {min(total_count, row_limit):,}개")
+    c1, c2, c3 = st.columns([2, 2, 1])
+    with c1:
+        category = st.selectbox("카테고리 선택", get_categories(), key="filter_category")
+    with c2:
+        search = st.text_input("문장 검색", key="sentence_search")
+    with c3:
+        limit = st.selectbox("표시 개수", [50, 100, 200, 500], index=1, key="result_limit")
 
+    df = get_sentence_df(category=category, search=search, limit=limit)
     if df.empty:
-        st.warning("저장된 문장이 없습니다.")
+        st.info("표시할 문장이 없습니다.")
         return
 
-    st.dataframe(df, use_container_width=True, hide_index=True, height=280)
-    options = [f"{row.ID} | {row.English[:60]}" for row in df.itertuples(index=False)]
-    selected_label = st.selectbox("문장 선택", options, key="select_sentence_row")
-    selected_id = int(selected_label.split("|")[0].strip())
-    row = get_sentence_by_id(selected_id)
+    labels = [f"[{r['id']}] {r['source_text'][:120]}{'...' if len(r['source_text']) > 120 else ''}" for _, r in df.iterrows()]
+    index_map = dict(zip(labels, df.to_dict(orient="records")))
+    selected_label = st.selectbox("문장 선택", labels, key="selected_sentence_label")
+    selected_row = index_map[selected_label]
 
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        if st.button("폼 불러오기", use_container_width=True, key="btn_load_sentence_form"):
-            queue_sentence_form(
-                sentence_id=row["id"],
-                english=row["source_text"] or "",
-                korean=row["target_text"] or "",
-                category=row["category"] or "",
-            )
+    st.markdown("**선택된 전체 문장**")
+    st.write(selected_row["source_text"])
+    if selected_row.get("target_text"):
+        st.caption(selected_row["target_text"])
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        if st.button("문장 불러오기", use_container_width=True, key="btn_load_sentence_form"):
+            st.session_state["pending_sentence_form"] = {
+                "sentence_id": int(selected_row["id"]),
+                "sentence_english": selected_row["source_text"] or "",
+                "sentence_korean": selected_row["target_text"] or "",
+                "sentence_mp3": selected_row["mp3_path"] or "",
+                "sentence_category": selected_row["category"] or "",
+            }
             st.rerun()
-    with b2:
+    with c2:
         if st.button("1회 재생", use_container_width=True, key="btn_play_once"):
-            if row and row["mp3_path"] and os.path.exists(row["mp3_path"]):
-                render_repeat_audio_player(row["mp3_path"], 1)
+            path = ensure_sentence_mp3(selected_row, lang="en")
+            if path:
+                play_audio_n_times(path, 1)
             else:
-                st.warning("해당 문장의 MP3가 없습니다.")
-    with b3:
-        if st.button(f"반복 재생 ({repeat_count}회)", use_container_width=True, key="btn_play_repeat"):
-            if row and row["mp3_path"] and os.path.exists(row["mp3_path"]):
-                render_repeat_audio_player(row["mp3_path"], int(repeat_count))
+                st.warning("재생할 수 없습니다.")
+    with c3:
+        if st.button("10회 재생", use_container_width=True, key="btn_play_repeat"):
+            path = ensure_sentence_mp3(selected_row, lang="en")
+            if path:
+                play_audio_n_times(path, 10)
             else:
-                st.warning("해당 문장의 MP3가 없습니다.")
+                st.warning("재생할 수 없습니다.")
+    with c4:
+        if st.button("카테고리 전체 재생", use_container_width=True, key="btn_play_category_all"):
+            rows = df.to_dict(orient="records")
+            audio_sources = []
+            for row in rows:
+                path = ensure_sentence_mp3(row, lang="en")
+                if path and os.path.exists(path):
+                    with open(path, "rb") as f:
+                        audio_sources.append(base64.b64encode(f.read()).decode())
+            if not audio_sources:
+                st.warning("재생할 수 있는 MP3가 없습니다.")
+            else:
+                source_tags = "\n".join([
+                    f'<source src="data:audio/mp3;base64,{b64}" type="audio/mp3">' for b64 in audio_sources
+                ])
+                playlist_html = f"""
+                <audio id="playlistPlayer" controls autoplay style="width:100%;"></audio>
+                <script>
+                const sources = [{','.join([repr('data:audio/mp3;base64,' + b64) for b64 in audio_sources])}];
+                const player = document.getElementById('playlistPlayer');
+                let idx = 0;
+                function playIndex(i) {{
+                    if (i >= sources.length) return;
+                    player.src = sources[i];
+                    player.play();
+                }}
+                player.onended = function() {{
+                    idx += 1;
+                    if (idx < sources.length) playIndex(idx);
+                }};
+                playIndex(0);
+                </script>
+                """
+                components.html(playlist_html, height=100)
 
+    display_df = df[["id", "source_text", "target_text", "category", "created_at"]].copy()
+    display_df.columns = ["ID", "English", "Korean", "Category", "Date"]
+    st.dataframe(display_df, use_container_width=True, height=320)
 
 
 def render_excel_tools():
-    with st.expander("Excel 가져오기 / 내보내기", expanded=False):
-        uploaded = st.file_uploader("Excel 가져오기 (.xlsx)", type=["xlsx"], key="excel_uploader")
-        if uploaded is not None:
-            if st.button("업로드한 Excel DB에 반영", use_container_width=True, key="btn_import_excel"):
+    st.subheader("Excel 가져오기 / 내보내기")
+    uploaded = st.file_uploader("EED Excel 업로드", type=["xlsx"], key="excel_upload")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Excel 가져오기 실행", use_container_width=True, key="btn_import_excel"):
+            if uploaded is None:
+                st.warning("먼저 Excel 파일을 선택하세요.")
+            else:
                 try:
-                    inserted = import_from_excel_file(uploaded)
-                    st.success(f"{inserted}건 불러왔습니다.")
-                    st.rerun()
+                    count = import_from_excel(uploaded)
+                    st.success(f"{count}개 문장을 가져왔습니다.")
                 except Exception as e:
-                    st.error(f"엑셀 가져오기 오류: {e}")
-
-        excel_bytes = export_sentences_to_excel_bytes()
+                    st.error(f"가져오기 실패: {e}")
+    with c2:
+        excel_bytes = export_to_excel_bytes()
         st.download_button(
-            "엑셀로 내보내기",
+            "Excel 내보내기",
             data=excel_bytes,
-            file_name="eed_sentences_export.xlsx",
+            file_name="EED_export.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
+            key="btn_export_excel",
         )
 
 
 def render_word_search():
-    st.markdown("#### 단어 검색")
-    st.text_input("영어 단어 입력", key="dict_search_word")
+    st.subheader("단어 검색")
+    word = st.text_input("영어 단어 입력", key="search_word_input")
+
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("검색", use_container_width=True, key="btn_dict_search"):
-            word = st.session_state.dict_search_word.strip()
-            if not word:
+        if st.button("검색", use_container_width=True, key="btn_search_word"):
+            if not word.strip():
                 st.warning("단어를 입력하세요.")
             else:
-                try:
-                    meaning = search_word_meaning(word)
-                    st.session_state.dict_search_result = meaning
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"검색 오류: {e}")
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute("SELECT meaning FROM dictionary WHERE word=?", (word.strip(),))
+                row = cur.fetchone()
+                conn.close()
+                if row:
+                    st.session_state["wordbook_word"] = word.strip()
+                    st.session_state["wordbook_meaning"] = row[0]
+                    st.success(f"뜻: {row[0]}")
+                else:
+                    meaning = translate_en_to_ko(word.strip())
+                    st.session_state["wordbook_word"] = word.strip()
+                    st.session_state["wordbook_meaning"] = meaning
+                    if meaning.startswith("번역 오류") or meaning.startswith("번역기 모듈"):
+                        st.error(meaning)
+                    else:
+                        st.success(f"뜻: {meaning}")
     with c2:
-        if st.button("단어장 저장", use_container_width=True, key="btn_dict_save_wordbook"):
-            word = st.session_state.dict_search_word.strip()
-            meaning = st.session_state.dict_search_result.strip()
-            if not word or not meaning:
-                st.warning("먼저 검색 결과를 만드세요.")
+        if st.button("단어장 저장", use_container_width=True, key="btn_add_wordbook_from_search"):
+            word_val = st.session_state.get("wordbook_word", "").strip() or word.strip()
+            meaning_val = st.session_state.get("wordbook_meaning", "").strip()
+            if not word_val or not meaning_val:
+                st.warning("먼저 검색하여 뜻을 확인하세요.")
             else:
-                add_wordbook(word, meaning)
+                save_word(None, word_val, meaning_val)
                 st.success("단어장에 저장했습니다.")
+                st.rerun()
 
-    st.text_area("검색 결과", value=st.session_state.dict_search_result, height=180, disabled=True, key="dict_search_result_box")
+    if st.session_state.get("wordbook_word"):
+        st.markdown("**검색 결과**")
+        st.write(f"- Word: {st.session_state.get('wordbook_word','')}")
+        st.write(f"- Meaning: {st.session_state.get('wordbook_meaning','')}")
 
 
 def render_wordbook():
-    sub1, sub2 = st.tabs(["단어 입력", "단어 목록"])
-
-    with sub1:
+    st.subheader("단어장")
+    c1, c2 = st.columns(2)
+    with c1:
         st.text_input("Word", key="wordbook_word")
-        st.text_area("Meaning", key="wordbook_meaning", height=110)
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            if st.button("추가", use_container_width=True, key="btn_wordbook_add"):
-                w = st.session_state.wordbook_word.strip()
-                m = st.session_state.wordbook_meaning.strip()
-                if not w or not m:
-                    st.warning("Word/Meaning을 입력하세요.")
-                else:
-                    add_wordbook(w, m)
-                    reset_wordbook_form()
-                    st.success("추가되었습니다.")
-                    st.rerun()
-        with c2:
-            if st.button("수정", use_container_width=True, key="btn_wordbook_update"):
-                if not st.session_state.wordbook_id:
-                    st.warning("먼저 단어 목록에서 선택하세요.")
-                else:
-                    w = st.session_state.wordbook_word.strip()
-                    m = st.session_state.wordbook_meaning.strip()
-                    if not w or not m:
-                        st.warning("Word/Meaning을 입력하세요.")
-                    else:
-                        update_wordbook(st.session_state.wordbook_id, w, m)
-                        st.success("수정되었습니다.")
-                        st.rerun()
-        with c3:
-            if st.button("삭제", use_container_width=True, key="btn_wordbook_delete"):
-                if not st.session_state.wordbook_id:
-                    st.warning("먼저 단어 목록에서 선택하세요.")
-                else:
-                    delete_wordbook(st.session_state.wordbook_id)
-                    reset_wordbook_form()
-                    st.success("삭제되었습니다.")
-                    st.rerun()
-        with c4:
-            if st.button("초기화", use_container_width=True, key="btn_wordbook_reset"):
-                reset_wordbook_form()
-                st.rerun()
+    with c2:
+        st.text_input("Meaning", key="wordbook_meaning")
 
-    with sub2:
-        wb_df = list_wordbook()
-        if wb_df.empty:
-            st.warning("단어장에 저장된 항목이 없습니다.")
-        else:
-            st.dataframe(wb_df, use_container_width=True, hide_index=True, height=320)
-            options = [f"{row.ID} | {row.Word}" for row in wb_df.itertuples(index=False)]
-            selected_word = st.selectbox("단어 선택", options, key="select_wordbook_row")
-            selected_id = int(selected_word.split("|")[0].strip())
-            selected_row = wb_df[wb_df["ID"] == selected_id].iloc[0]
-            if st.button("선택 단어 폼 불러오기", use_container_width=True, key="btn_load_wordbook_form"):
-                queue_wordbook_form(
-                    wordbook_id=int(selected_row["ID"]),
-                    word=selected_row["Word"],
-                    meaning=selected_row["Meaning"],
-                )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("저장", use_container_width=True, key="btn_save_wordbook"):
+            word = st.session_state.get("wordbook_word", "").strip()
+            meaning = st.session_state.get("wordbook_meaning", "").strip()
+            if not word or not meaning:
+                st.warning("단어와 뜻을 입력하세요.")
+            else:
+                save_word(st.session_state.get("selected_wordbook_id"), word, meaning)
+                st.success("저장되었습니다.")
+                reset_word_form()
                 st.rerun()
+    with c2:
+        if st.button("삭제", use_container_width=True, key="btn_delete_wordbook"):
+            wid = st.session_state.get("selected_wordbook_id")
+            if wid:
+                delete_word(wid)
+                st.success("삭제되었습니다.")
+                reset_word_form()
+                st.rerun()
+            else:
+                st.warning("삭제할 단어를 선택하세요.")
+    with c3:
+        if st.button("초기화", use_container_width=True, key="btn_reset_wordbook"):
+            reset_word_form()
+            st.rerun()
+
+    df = get_wordbook_df()
+    if not df.empty:
+        labels = [f"[{r['id']}] {r['word']} = {r['meaning']}" for _, r in df.iterrows()]
+        index_map = dict(zip(labels, df.to_dict(orient="records")))
+        selected_label = st.selectbox("단어 선택", labels, key="selected_word_label")
+        selected_row = index_map[selected_label]
+        st.write(selected_row["word"], "-", selected_row["meaning"])
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("선택 단어 폼 불러오기", use_container_width=True, key="btn_load_wordbook_form"):
+                st.session_state["pending_word_form"] = {
+                    "wordbook_id": int(selected_row["id"]),
+                    "word": selected_row["word"],
+                    "meaning": selected_row["meaning"],
+                }
+                st.rerun()
+        with c2:
+            st.dataframe(df.rename(columns={"id": "ID", "word": "Word", "meaning": "Meaning"}), use_container_width=True, height=300)
+    else:
+        st.info("단어장 데이터가 없습니다.")
 
 
 def main():
-    st.set_page_config(page_title="EED Web v5", page_icon="📘", layout="wide")
+    st.set_page_config(page_title="EED (English Expression Dictionary)", page_icon="📘", layout="wide")
     init_db()
     prepare_session_state()
     apply_pending_updates()
     apply_compact_css()
 
-    st.title("📘 EED Web v5")
-    st.caption("선택 문장 영역을 제거하고, 안드로이드에서도 보기 쉽게 정리한 버전")
+    title_col, help_col = st.columns([3, 2])
+    with title_col:
+        st.title("📘 EED (English Expression Dictionary)")
+    with help_col:
+      
+       st.info("""
+                     ### 사용방법
+      1. 목록/재생에서 카테고리를 선택합니다.
+      2. 문장을 선택한 뒤 문장 불러오기를 누릅니다.
+      3. 1회 재생 / 10회 재생 / 카테고리 전체 재생으로 학습합니다.
+      4. MP3가 없으면 재생 시 자동 생성됩니다.
+      5. 새 문장 추가/수정은 입력/수정 탭에서 합니다.
+       """)
 
     tab1, tab2, tab3 = st.tabs(["표현 사전", "단어 검색", "단어장"])
 
