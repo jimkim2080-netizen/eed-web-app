@@ -201,6 +201,8 @@ def prepare_session_state():
         "pending_sentence_form": None,
         "pending_word_form": None,
         "pending_translation": None,
+        "pending_sentence_reset": False,
+        "pending_word_reset": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -229,19 +231,19 @@ def apply_pending_updates():
         st.session_state["sentence_korean"] = pending_translation
         st.session_state["pending_translation"] = None
 
+    if st.session_state.get("pending_sentence_reset"):
+        st.session_state["sentence_id"] = None
+        st.session_state["sentence_english"] = ""
+        st.session_state["sentence_korean"] = ""
+        st.session_state["sentence_mp3"] = ""
+        st.session_state["sentence_category"] = ""
+        st.session_state["pending_sentence_reset"] = False
 
-def reset_sentence_form():
-    st.session_state["sentence_id"] = None
-    st.session_state["sentence_english"] = ""
-    st.session_state["sentence_korean"] = ""
-    st.session_state["sentence_mp3"] = ""
-    st.session_state["sentence_category"] = ""
-
-
-def reset_word_form():
-    st.session_state["selected_wordbook_id"] = None
-    st.session_state["wordbook_word"] = ""
-    st.session_state["wordbook_meaning"] = ""
+    if st.session_state.get("pending_word_reset"):
+        st.session_state["selected_wordbook_id"] = None
+        st.session_state["wordbook_word"] = ""
+        st.session_state["wordbook_meaning"] = ""
+        st.session_state["pending_word_reset"] = False
 
 
 def get_sentence_df(category: str = "All", search: str = "", limit: int = 100):
@@ -366,22 +368,22 @@ def render_sentence_editor():
                     st.session_state.get("sentence_mp3", ""),
                     category.strip(),
                 )
+                st.session_state["pending_sentence_reset"] = True
                 st.success("저장되었습니다.")
-                reset_sentence_form()
                 st.rerun()
     with c3:
         if st.button("삭제", use_container_width=True, key="btn_delete_sentence"):
             sid = st.session_state.get("sentence_id")
             if sid:
                 delete_sentence(sid)
+                st.session_state["pending_sentence_reset"] = True
                 st.success("삭제되었습니다.")
-                reset_sentence_form()
                 st.rerun()
             else:
                 st.warning("삭제할 문장을 먼저 불러오세요.")
     with c4:
         if st.button("초기화", use_container_width=True, key="btn_reset_sentence"):
-            reset_sentence_form()
+            st.session_state["pending_sentence_reset"] = True
             st.rerun()
 
     st.divider()
@@ -501,9 +503,6 @@ def render_sentence_list_and_player():
             if not audio_sources:
                 st.warning("재생할 수 있는 MP3가 없습니다.")
             else:
-                source_tags = "\n".join([
-                    f'<source src="data:audio/mp3;base64,{b64}" type="audio/mp3">' for b64 in audio_sources
-                ])
                 playlist_html = f"""
                 <audio id="playlistPlayer" controls autoplay style="width:100%;"></audio>
                 <script>
@@ -617,7 +616,7 @@ def render_wordbook():
             else:
                 save_word(st.session_state.get("selected_wordbook_id"), word, meaning)
                 st.success("저장되었습니다.")
-                reset_word_form()
+                st.session_state["pending_word_reset"] = True
                 st.rerun()
     with c2:
         if st.button("삭제", use_container_width=True, key="btn_delete_wordbook"):
@@ -625,13 +624,13 @@ def render_wordbook():
             if wid:
                 delete_word(wid)
                 st.success("삭제되었습니다.")
-                reset_word_form()
+                st.session_state["pending_word_reset"] = True
                 st.rerun()
             else:
                 st.warning("삭제할 단어를 선택하세요.")
     with c3:
         if st.button("초기화", use_container_width=True, key="btn_reset_wordbook"):
-            reset_word_form()
+            st.session_state["pending_word_reset"] = True
             st.rerun()
 
     df = get_wordbook_df()
@@ -668,15 +667,17 @@ def main():
     with title_col:
         st.title("📘 EED (English Expression Dictionary)")
     with help_col:
-      
-       st.info("""
-                     ### 사용방법
-      1. 목록/재생에서 카테고리를 선택합니다.
-      2. 문장을 선택한 뒤 문장 불러오기를 누릅니다.
-      3. 1회 재생 / 10회 재생 / 카테고리 전체 재생으로 학습합니다.
-      4. MP3가 없으면 재생 시 자동 생성됩니다.
-      5. 새 문장 추가/수정은 입력/수정 탭에서 합니다.
-       """)
+        st.info(
+            """
+**사용 방법**
+
+1. **목록/재생**에서 카테고리를 선택합니다.  
+2. 문장을 선택한 뒤 **문장 불러오기**를 누릅니다.  
+3. **1회 재생 / 10회 재생 / 카테고리 전체 재생**으로 학습합니다.  
+4. MP3가 없으면 재생 시 자동 생성됩니다.  
+5. 새 문장 추가/수정은 **입력/수정** 탭에서 합니다.
+            """
+        )
 
     tab1, tab2, tab3 = st.tabs(["표현 사전", "단어 검색", "단어장"])
 
