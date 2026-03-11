@@ -667,10 +667,8 @@ def main():
     with title_col:
         st.title("📘 EED (English Expression Dictionary)")
     with help_col:
-        st.info(
-            """
-**사용 방법**
-
+        st.info("""
+      ### 사용방법
 1. **목록/재생**에서 카테고리를 선택합니다.  
 2. 문장을 선택한 뒤 **문장 불러오기**를 누릅니다.  
 3. **1회 재생 / 10회 재생 / 카테고리 전체 재생**으로 학습합니다.  
