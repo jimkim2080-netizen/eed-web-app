@@ -425,15 +425,15 @@ def render_sentence_editor():
             else:
                 st.warning("먼저 문장을 불러오거나 입력하세요.")
     with c3:
-        if st.button("5회 재생", use_container_width=True, key="btn_editor_play_repeat"):
+        if st.button("10회 재생", use_container_width=True, key="btn_editor_play_repeat"):
             path = st.session_state.get("sentence_mp3", "")
             if path and os.path.exists(path):
-                play_audio_n_times(path, 5)
+                play_audio_n_times(path, 10)
             elif current_text:
                 path = ensure_sentence_mp3({"id": current_id or 999999, "source_text": current_text, "mp3_path": path}, lang="en")
                 if path:
                     st.session_state["sentence_mp3"] = path
-                    play_audio_n_times(path, 5)
+                    play_audio_n_times(path, 10)
                 else:
                     st.warning("재생할 MP3를 만들 수 없습니다.")
             else:
